@@ -1,57 +1,57 @@
 """
-Vercel serverless API wrapper for the ECI electoral-search script.
+Rudra — FastAPI server for manual-captcha ECI electoral search.
 
 Endpoints:
- - POST /api/search    { "epic": "ZJJ2263770" }
- - GET  /api/search?epic=ZJJ2263770
+ - GET /api/captcha       -> { id: str, captcha: base64-image }
+ - POST /api/search       -> { ... }  (returns upstream JSON on success)
+ - GET /                   -> serves the Rudra UI (index.html)
 
-Environment:
- - GEMINI_KEY (required): Gemini API key
- - CAPTCHA_KEY_B64 (optional): base64 captcha key (defaults to embedded)
- - PUBKEY_B64 (optional): base64 DER public key (defaults to embedded)
+Environment variables (set on Vercel or locally):
+ - CAPTCHA_KEY_B64  (required) : base64 AES-256-GCM key used to decrypt upstream captcha blob
+ - PUBKEY_B64       (required) : base64 DER/SPKI RSA public key used to wrap AES key for upstream
+
+Notes:
+ - This app does NOT perform OCR. The UI shows the captcha image and the user types the code.
+ - Do NOT commit secret keys to source control. Use environment variables on Vercel.
 """
+import os
 import base64
 import json
-import os
-import re
 import time
-import io
-from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
-
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, HTMLResponse
+from pydantic import BaseModel
 import requests
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding
-from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
-from PIL import Image, ImageEnhance
 
 # Configuration
 BASE = "https://gateway-voters.eci.gov.in"
 ORIGIN = "https://electoralsearch.eci.gov.in"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
-GEMINI_KEY = os.environ.get("GEMINI_KEY", "")
-GEMINI_API = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent"
-
-# Optional: move these to env for production
-CAPTCHA_KEY_B64 = os.environ.get("CAPTCHA_KEY_B64",
-    "e855n97lc4tcPkj7WWsi38yNWpalLBLZzQdkqHWYbZ0=")
-PUBKEY_B64 = os.environ.get("PUBKEY_B64", (
-    "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArb7++BxL/YN8OIln+6FL9"
-    "Gnw5DNmQ/VFZXss+J+TuQyJc891JbqbijxYQNEin2c2u+CnpXpoGQ/1gUSzDMJeN"
-    "S3sNSlIUykp2dt7xIm/cmV4sZ/c769vCxVRosMfRaZJnBAah+m1X26lEhnOo0wpAB"
-    "9Txr8RIyBe6h7PiQWykeJeh6UacOBBX28kgkq7+vJhW8HgB38lt32XRocznRYwS9L"
-    "qR7ZweFmQhTr1+EGrqiEKCOCxMYgHR2SQckb96hZ9kWzfzeun4bUO5oXKJciLkiS1"
-    "IgKieADEvYLgu129ZIpn1H+8H+8ikNNVETqEDDMtqcQcQmWppJvcWHaXAs+f8QIDAQAB"
-))
-SAMPLES = 4
-MAX_CAPTCHAS = 4
 TIMEOUT = 10
 
-# decode captcha key to bytes for AESGCM
-CAPTCHA_KEY = base64.b64decode(CAPTCHA_KEY_B64)
+# Secrets from environment
+CAPTCHA_KEY_B64 = os.environ.get("CAPTCHA_KEY_B64")
+PUBKEY_B64 = os.environ.get("PUBKEY_B64")
+
+if not CAPTCHA_KEY_B64:
+    # For local convenience only, you may set defaults in .env; in production require envs.
+    # Do not commit real keys into the repo.
+    CAPTCHA_KEY_B64 = os.environ.get("CAPTCHA_KEY_B64", None)
+
+app = FastAPI(title="Rudra — ECI Electoral Search")
+
+# Read UI file to serve at root
+ROOT_HTML_PATH = os.path.join(os.path.dirname(__file__), '..', 'index.html')
+try:
+    with open(ROOT_HTML_PATH, 'r', encoding='utf-8') as f:
+        INDEX_HTML = f.read()
+except Exception:
+    INDEX_HTML = "<html><body><h1>Rudra</h1><p>index.html missing</p></body></html>"
 
 
 def headers():
@@ -67,83 +67,53 @@ def headers():
     }
 
 
-def decrypt_blob(b64blob):
+def decrypt_blob(b64blob: str) -> dict:
+    if not CAPTCHA_KEY_B64:
+        raise RuntimeError("CAPTCHA_KEY_B64 not configured")
     blob = base64.b64decode(b64blob)
-    return json.loads(AESGCM(CAPTCHA_KEY).decrypt(blob[:12], blob[12:], None).decode("utf-8"))
-
-
-def get_captcha(sess, tries=3):
-    sess.get("https://electoralsearch.eci.gov.in/", headers=headers(), timeout=TIMEOUT)
-    for attempt in range(tries):
-        r = sess.get(f"{BASE}/api/v1/captcha-service/getCaptcha/sir", headers=headers(), timeout=TIMEOUT)
-        if r.status_code == 200 and r.text.lstrip().startswith("{"):
-            try:
-                return decrypt_blob(r.json()["data"])
-            except Exception:
-                pass
-        bb = r.text.strip()[:120] or f"(empty body, status {r.status_code})"
-        if attempt < tries - 1:
-            time.sleep(1.0 + attempt)
-    raise RuntimeError(f"getCaptcha failed after {tries} tries: {bb}")
-
-
-def preprocess(b64_image):
-    """
-    Pillow-based preprocessing (upscale 3x lanczos, grayscale, contrast/brightness).
-    Returns base64-encoded PNG suitable for the Gemini upload inline_data.
-    """
-    raw = base64.b64decode(b64_image)
+    if len(blob) < 13:
+        raise RuntimeError("Encrypted blob too short")
+    iv = blob[:12]
+    ciphertext = blob[12:]
+    key = base64.b64decode(CAPTCHA_KEY_B64)
+    if len(key) != 32:
+        raise RuntimeError("CAPTCHA_KEY_B64 must decode to 32 bytes (AES-256 key)")
     try:
-        im = Image.open(io.BytesIO(raw))
-        w, h = im.size
-        im = im.resize((w * 3, h * 3), resample=Image.LANCZOS).convert("L")
-        im = ImageEnhance.Contrast(im).enhance(1.6)
-        im = ImageEnhance.Brightness(im).enhance(1.02)
-        buf = io.BytesIO()
-        im.save(buf, format="PNG")
-        return base64.b64encode(buf.getvalue()).decode()
+        plain = AESGCM(key).decrypt(iv, ciphertext, None)
+        return json.loads(plain.decode('utf-8'))
+    except Exception as e:
+        raise RuntimeError(f"Failed to decrypt captcha blob: {e}")
+
+
+def get_captcha_from_upstream(tries: int = 3) -> dict:
+    sess = requests.Session()
+    # Prime the session by hitting the electoralsearch homepage
+    try:
+        sess.get("https://electoralsearch.eci.gov.in/", headers=headers(), timeout=TIMEOUT)
     except Exception:
-        # fallback to raw if Pillow fails
-        return b64_image
-
-
-def ocr(b64_image, temperature=0.2):
-    if not GEMINI_KEY:
-        return ""
-    payload = {
-        "contents": [{
-            "parts": [
-                {"text": ("Exactly transcribe the captcha code in this image. It is 5-7 alphanumeric "
-                          "characters with a diagonal line through it. Ignore the diagonal line and all "
-                          "noise. Reply with ONLY the code, nothing else. Example: `ab12cd`.")},
-                {"inline_data": {"mime_type": "image/png",
-                                 "data": base64.b64encode(base64.b64decode(b64_image)).decode()}},
-            ]
-        }],
-        "generationConfig": {"temperature": temperature, "maxOutputTokens": 16},
-    }
-    url = f"{GEMINI_API}?key={GEMINI_KEY}"
-    for attempt in range(3):
+        pass
+    last_err = None
+    for attempt in range(tries):
         try:
-            r = requests.post(url, json=payload, timeout=45)
-            if r.status_code in (429, 500, 503) and attempt < 2:
-                time.sleep(1.5 * (attempt + 1))
-                continue
-            r.raise_for_status()
-            res = r.json()
-            parts = res.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-            return (parts[0].get("text", "") if parts else "").strip()
-        except requests.HTTPError:
-            return ""
-        except Exception:
-            return ""
-    return ""
+            r = sess.get(f"{BASE}/api/v1/captcha-service/getCaptcha/sir", headers=headers(), timeout=TIMEOUT)
+            if r.status_code == 200 and r.text.lstrip().startswith('{'):
+                j = r.json()
+                if 'data' in j:
+                    return decrypt_blob(j['data'])
+            last_err = f"unexpected upstream response (status {r.status_code})"
+        except Exception as e:
+            last_err = str(e)
+        time.sleep(0.5 + attempt)
+    raise RuntimeError(f"getCaptcha failed: {last_err}")
 
 
-def encrypt_payload(payload):
+def encrypt_payload(payload: dict) -> dict:
+    if not PUBKEY_B64:
+        raise RuntimeError("PUBKEY_B64 not configured")
     pub = serialization.load_der_public_key(base64.b64decode(PUBKEY_B64))
-    key, nonce = os.urandom(32), os.urandom(12)
-    ct = AESGCM(key).encrypt(nonce, json.dumps(payload, separators=(",", ":")).encode(), None)
+    key = os.urandom(32)
+    nonce = os.urandom(12)
+    ct = AESGCM(key).encrypt(nonce, json.dumps(payload, separators=(',', ':')).encode(), None)
     wrapped = pub.encrypt(key, padding.OAEP(
         mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
     return {"encryptedPayload": base64.b64encode(ct).decode(),
@@ -151,89 +121,56 @@ def encrypt_payload(payload):
             "iv": base64.b64encode(nonce).decode()}
 
 
-def search_epic(sess, epic, captcha_id, answer):
+def search_epic_upstream(epic: str, captcha_id: str, answer: str):
     p = {"epicNumber": epic, "isPortal": True, "captchaId": captcha_id,
          "captchaData": answer, "securityKey": "na", "eSEARCHYNEFjd3S": "1021"}
-    r = sess.post(f"{BASE}/api/v1/elastic/search-by-epic-from-national-display-v1",
-                  data=json.dumps(encrypt_payload(p)).encode(), headers=headers(), timeout=TIMEOUT)
-    if r.status_code == 200:
-        try:
-            return 200, r.json()
-        except Exception:
-            return 200, r.text
-    return r.status_code, r.text[:120]
-
-
-def summarize(rec):
-    if not isinstance(rec, dict):
-        return " " + str(rec)
-    c = rec.get("content", rec)
-    g = lambda k: c.get(k)
-    return (f"\n  EPIC ........ {g('epicNumber')}\n"
-            f"  Name ........ {g('fullName')}\n"
-            f"  Age/Gender .. {g('age')} / {g('gender')}\n"
-            f"  Relation .... {g('relativeFullName')} ({g('relationType')})\n"
-            f"  Address ..... {g('buildingAddress')}\n"
-            f"  Booth ....... {g('psBuildingName')} - Room {g('psRoomDetails')}\n"
-            f"  Assembly .... {g('asmblyName')} (AC {g('acNumber')})\n"
-            f"  Parliament .. {g('prlmntName')} (No. {g('prlmntNo')})\n"
-            f"  District .... {g('districtValue')} ({g('districtCd')})\n"
-            f"  State ....... {g('stateName')} ({g('stateCd')})\n"
-            f"  Part ........ {g('partName')} # {g('partNumber')}\n"
-            f"  EPIC issued . {g('epicDatetime')}")
-
-
-def run(epic):
-    t0 = time.time()
+    data = encrypt_payload(p)
     sess = requests.Session()
-    for cap_i in range(1, MAX_CAPTCHAS + 1):
-        try:
-            cap = get_captcha(sess)
-        except RuntimeError:
-            time.sleep(2)
-            continue
-        cid = cap.get("id")
-        proc = preprocess(cap.get("captcha"))
-        with ThreadPoolExecutor(max_workers=SAMPLES) as ex:
-            raws = list(ex.map(lambda _: ocr(proc), range(SAMPLES)))
-        codes = []
-        for r in raws:
-            m = re.search(r"[A-Za-z0-9]{4,8}", r or "")
-            if m:
-                codes.append(m.group(0))
-        cands = [c for c, _ in Counter(codes).most_common()] if codes else []
-        for a in cands:
-            sco, body = search_epic(sess, epic, cid, a)
-            if sco == 200 and isinstance(body, list) and body:
-                # success
-                return body
-            if sco == 429:
-                time.sleep(2.0)
-        time.sleep(1.0)
-    return None
-
-
-# FastAPI app
-app = FastAPI(title="ECI Electoral Search API")
+    r = sess.post(f"{BASE}/api/v1/elastic/search-by-epic-from-national-display-v1", headers=headers(), data=json.dumps(data).encode(), timeout=TIMEOUT)
+    status = r.status_code
+    try:
+        body = r.json()
+    except Exception:
+        body = r.text
+    return status, body
 
 
 class SearchRequest(BaseModel):
     epic: str
+    captchaId: str
+    captchaData: str
 
 
-@app.post("/api/search")
-def search_post(req: SearchRequest):
+@app.get('/', response_class=HTMLResponse)
+async def root():
+    return HTMLResponse(INDEX_HTML)
+
+
+@app.get('/api/captcha')
+async def api_get_captcha():
+    try:
+        cap = get_captcha_from_upstream()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    cid = cap.get('id')
+    captcha_b64 = cap.get('captcha')
+    if not cid or not captcha_b64:
+        raise HTTPException(status_code=502, detail='Malformed captcha response from upstream')
+    return JSONResponse({"id": cid, "captcha": captcha_b64})
+
+
+@app.post('/api/search')
+async def api_search(req: SearchRequest):
     if not req.epic:
-        raise HTTPException(status_code=400, detail="epic is required")
-    result = run(req.epic)
-    if result:
-        return result
-    raise HTTPException(status_code=404, detail="No result found")
-
-
-@app.get("/api/search")
-def search_get(epic: str = Query(..., min_length=1)):
-    result = run(epic)
-    if result:
-        return result
-    raise HTTPException(status_code=404, detail="No result found")
+        raise HTTPException(status_code=400, detail='epic is required')
+    if not req.captchaId or not req.captchaData:
+        raise HTTPException(status_code=400, detail='captchaId and captchaData are required')
+    try:
+        status, body = search_epic_upstream(req.epic, req.captchaId, req.captchaData)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    if status == 200:
+        return JSONResponse(body)
+    if status == 429:
+        raise HTTPException(status_code=429, detail='Upstream rate limit')
+    raise HTTPException(status_code=502, detail=f'Upstream error: {str(body)[:300]}')
