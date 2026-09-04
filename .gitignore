@@ -1,0 +1,10 @@
+# Byte-compiled / env / virtualenv
+__pycache__/
+.venv/
+.env
+.env.*
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+*.sqlite3
