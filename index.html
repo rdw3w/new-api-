@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Rudra — ECI Electoral Search</title>
+  <meta name="description" content="Rudra — Manual-captcha ECI search UI" />
+  <style>
+    :root{--bg:#0f1724;--card:#0b1220;--muted:#94a3b8;--accent:#7c3aed;--ok:#16a34a;--danger:#ef4444}
+    *{box-sizing:border-box;font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,'Helvetica Neue',Arial}
+    body{margin:0;background:linear-gradient(180deg,#071129 0%,#071226 60%);color:#e6eef8;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:32px}
+    .card{width:100%;max-width:960px;background:linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01));border-radius:12px;padding:22px;box-shadow:0 6px 30px rgba(2,6,23,0.6);}
+    header{display:flex;align-items:center;gap:16px}
+    .logo{width:56px;height:56px;border-radius:10px;background:linear-gradient(135deg,var(--accent),#2dd4bf);display:flex;align-items:center;justify-content:center;font-weight:700;color:#041124;font-size:20px}
+    h1{margin:0;font-size:20px}
+    p.lead{margin:6px 0 16px;color:var(--muted)}
+    .grid{display:grid;grid-template-columns:1fr 380px;gap:18px}
+    .panel{background:var(--card);padding:14px;border-radius:10px}
+    label{display:block;color:var(--muted);font-size:13px;margin-bottom:6px}
+    input[type=text]{width:100%;padding:10px;border-radius:8px;border:1px solid rgba(255,255,255,0.03);background:transparent;color:inherit}
+    button{background:var(--accent);border:none;padding:10px 12px;color:white;border-radius:8px;cursor:pointer}
+    button.ghost{background:transparent;border:1px solid rgba(255,255,255,0.04)}
+    .muted{color:var(--muted);font-size:13px}
+    .captcha-box{display:flex;flex-direction:column;gap:8px;align-items:center}
+    .captcha-img{width:100%;height:auto;max-width:320px;border-radius:8px;border:1px solid rgba(255,255,255,0.03);background:#fff;padding:8px}
+    .notice{font-size:13px;color:var(--muted);margin-top:8px}
+    .result{white-space:pre-wrap;font-family:ui-monospace,monospace;background:rgba(10,14,20,0.6);padding:12px;border-radius:8px;color:#d8f3dc}
+    .actions{display:flex;gap:8px;align-items:center}
+    footer{margin-top:12px;color:var(--muted);font-size:13px}
+    .error{color:var(--danger)}
+    @media(max-width:880px){.grid{grid-template-columns:1fr;}.captcha-img{max-width:100%}}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <header>
+      <div class="logo">R</div>
+      <div>
+        <h1>Rudra — ECI Electoral Search</h1>
+        <p class="lead">Manual captcha flow — no automated OCR. Fetch captcha, show to user, enter code, get results.</p>
+      </div>
+    </header>
+
+    <div class="grid" style="margin-top:16px">
+      <div>
+        <div class="panel">
+          <label for="epic">EPIC number</label>
+          <input id="epic" placeholder="e.g. ZJJ2263770" />
+
+          <div style="height:12px"></div>
+
+          <div class="actions" style="margin-bottom:10px">
+            <button id="getCaptchaBtn">Get Captcha</button>
+            <button id="refreshBtn" class="ghost" disabled>Refresh</button>
+            <div style="flex:1"></div>
+            <div id="status" class="muted">Ready</div>
+          </div>
+
+          <div id="captchaArea" style="display:none">
+            <div class="captcha-box">
+              <img id="captchaImg" class="captcha-img" alt="captcha" />
+              <div style="width:100%">
+                <label for="captchaInput">Enter captcha code</label>
+                <input id="captchaInput" placeholder="Type the captcha exactly" />
+              </div>
+            </div>
+
+            <div style="height:10px"></div>
+            <div class="actions">
+              <button id="submitBtn">Search EPIC</button>
+              <button id="downloadBtn" class="ghost" disabled>Download JSON</button>
+              <div style="flex:1"></div>
+              <div id="hint" class="muted">Captcha IDs are single-use; don't call verify first.</div>
+            </div>
+          </div>
+
+        </div>
+
+        <footer>
+          <div>Made with care — Rudra</div>
+        </footer>
+      </div>
+
+      <div>
+        <div class="panel">
+          <h3 style="margin-top:0">Response</h3>
+          <div id="response" class="result muted">No response yet.</div>
+          <div id="responseMeta" style="margin-top:8px;color:var(--muted)"></div>
+        </div>
+
+        <div style="height:12px"></div>
+
+        <div class="panel">
+          <h3 style="margin-top:0">Notes</h3>
+          <ul class="muted">
+            <li>Rudra does NOT use automated OCR. You must enter the captcha code shown.</li>
+            <li>If you get HTTP 429 (rate limit), wait a few seconds and try again.</li>
+            <li>Do not share your GEMINI or server keys. They are not needed by Rudra.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const getCaptchaBtn = document.getElementById('getCaptchaBtn')
+    const refreshBtn = document.getElementById('refreshBtn')
+    const captchaArea = document.getElementById('captchaArea')
+    const captchaImg = document.getElementById('captchaImg')
+    const captchaInput = document.getElementById('captchaInput')
+    const submitBtn = document.getElementById('submitBtn')
+    const statusEl = document.getElementById('status')
+    const responseEl = document.getElementById('response')
+    const responseMeta = document.getElementById('responseMeta')
+    const epicInput = document.getElementById('epic')
+    const downloadBtn = document.getElementById('downloadBtn')
+
+    let lastCaptcha = null
+    let lastResult = null
+
+    function setStatus(text, isError=false){
+      statusEl.textContent = text
+      statusEl.style.color = isError ? 'var(--danger)' : 'var(--muted)'
+    }
+
+    async function fetchCaptcha(){
+      setStatus('Fetching captcha...')
+      responseEl.textContent = 'No response yet.'
+      responseMeta.textContent = ''
+      try{
+        const res = await fetch('/api/captcha')
+        if(!res.ok){
+          const j = await res.json().catch(()=>({detail:res.statusText}))
+          setStatus('Error fetching captcha', true)
+          responseEl.textContent = JSON.stringify(j, null, 2)
+          return
+        }
+        const j = await res.json()
+        lastCaptcha = j
+        captchaArea.style.display = 'block'
+        captchaImg.src = 'data:image/png;base64,' + j.captcha
+        captchaInput.value = ''
+        refreshBtn.disabled = false
+        setStatus('Captcha ready')
+      }catch(e){
+        setStatus('Network error', true)
+        responseEl.textContent = String(e)
+      }
+    }
+
+    getCaptchaBtn.addEventListener('click', ()=>fetchCaptcha())
+    refreshBtn.addEventListener('click', ()=>fetchCaptcha())
+
+    async function submitSearch(){
+      const epic = (epicInput.value||'').trim()
+      const code = (captchaInput.value||'').trim()
+      if(!epic){ setStatus('Enter EPIC', true); return }
+      if(!lastCaptcha){ setStatus('Fetch captcha first', true); return }
+      if(!code){ setStatus('Enter captcha code', true); return }
+      setStatus('Searching...')
+      responseEl.textContent = 'Searching...'
+      try{
+        const payload = { epic, captchaId: lastCaptcha.id, captchaData: code }
+        const res = await fetch('/api/search', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) })
+        if(res.status===429){ setStatus('Upstream rate limit (429)', true); responseEl.textContent='Rate limited'; return }
+        if(res.status===502){ const j = await res.json().catch(()=>null); setStatus('Upstream error', true); responseEl.textContent = JSON.stringify(j||{error:'upstream error'}, null, 2); return }
+        if(!res.ok){ const j = await res.json().catch(()=>({detail:res.statusText})); setStatus('Error', true); responseEl.textContent = JSON.stringify(j, null, 2); return }
+        const body = await res.json()
+        lastResult = body
+        responseEl.textContent = JSON.stringify(body, null, 2)
+        responseMeta.textContent = `Found ${Array.isArray(body)?body.length:1} record(s)`
+        setStatus('Success', false)
+        downloadBtn.disabled = false
+      }catch(e){ setStatus('Network error', true); responseEl.textContent = String(e) }
+    }
+
+    submitBtn.addEventListener('click', ()=>submitSearch())
+
+    downloadBtn.addEventListener('click', ()=>{
+      if(!lastResult) return
+      const dataStr = 'data:application/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(lastResult, null, 2))
+      const a = document.createElement('a')
+      a.href = dataStr
+      a.download = 'rudra_result.json'
+      a.click()
+    })
+
+    // keyboard-friendly: Enter on captchaInput triggers submit
+    captchaInput.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ submitSearch() } })
+
+  </script>
+</body>
+</html>
